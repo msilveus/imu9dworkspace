@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "lsm6dsox",
+    "lis3mdl",
+    "imu_app",
+]
+resolver = "3"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

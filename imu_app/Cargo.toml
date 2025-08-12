@@ -1,0 +1,42 @@
+[package]
+name = "imu_app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rtic = { version = "2.2.0", features = ["thumbv7-backend"] }
+rtic-monotonics = "2.1.0"
+systick-monotonic = "1.0.1"
+heapless = "0.8.0"
+cortex-m-rt = "0.7.5"
+lsm6dsox = { path = "../lsm6dsox" }
+lis3mdl = { path = "../lis3mdl" }
+embedded-hal = "1.0.0"
+embedded-hal-bus = "0.3.0"
+critical-section = "1.2.0"
+stm32f4xx-hal = { version = "0.22.1", features = ["stm32f401", "tim2"] }
+# Optional RTT logging
+#log = { version = "0.4", optional = true }
+libm = "0.2.15"
+panic-rtt-target = { version = "0.2.0" }
+# fallback panic handler when RTT is disabled
+#panic-halt = "1.0.0"
+rtt-target = { version = "0.6.1" }
+shared-bus = "0.3.1"
+#rtt-logger = "0.2.1"
+nb = "1.1.0"
+
+[dependencies.cortex-m]
+version = "0.7.7"
+features = ["critical-section-single-core"]
+
+[patch.crates-io]
+nb = { version = "1.1.0", optional = false }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+build = "build.rs"
