@@ -333,7 +333,7 @@ pub const CONFIG_SENSOR_HUB_LIS3MDL_MIXED: &[AnyRegConfig] = &[
         op: RegOp::Write,
         reg: UnifiedRegister::SensorHub(SensorHubReg::MasterConfig),
         value:  MasterConfigAuxSensor::OneSensor as u8 |
-            // MasterConfigFlags::START_CONFIG.bits() |
+            MasterConfigFlags::START_CONFIG.bits() |
             MasterConfigFlags::WRITE_ONCE.bits(),
     },
     AnyRegConfig {
@@ -368,3 +368,4 @@ pub const CONFIG_SH_MASTER_ON: &[RegConfig<SensorHubReg>] = &[
         value: 0, // disable SensorHubReg
     },
 ];
+
