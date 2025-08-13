@@ -358,7 +358,7 @@ pub const CONFIG_SH_MASTER_ON: &[RegConfig<SensorHubReg>] = &[
         op: RegOp::Write,
         reg: SensorHubReg::MasterConfig,
         value:  MasterConfigAuxSensor::OneSensor as u8 |
-            // MasterConfigFlags::START_CONFIG.bits() |
+            MasterConfigFlags::START_CONFIG.bits() |
             MasterConfigFlags::WRITE_ONCE.bits() |
             MasterConfigFlags::MASTER_ON.bits(),
     },
@@ -368,4 +368,5 @@ pub const CONFIG_SH_MASTER_ON: &[RegConfig<SensorHubReg>] = &[
         value: 0, // disable SensorHubReg
     },
 ];
+
 
