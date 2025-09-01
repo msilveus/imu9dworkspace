@@ -5,90 +5,123 @@
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 
+extern crate alloc;
+
 mod shared_i2c;
 mod sensor_hub_control;
 mod core_filters;
 mod core_calibrate;
 mod core_data_types;
+mod core_uart_logger;
+mod simple_ring_buffer;
+mod core_temp_correction;
 
-use panic_rtt_target as _;
+use alloc::format;
+use alloc::string::ToString;
+use panic_halt as _;
 use cortex_m_rt::entry;
+use core::mem::MaybeUninit;
+use embedded_alloc::*;
 
-// use log::{info, warn, error, debug, trace};
+use heapless::Vec;
+use cortex_m::peripheral::NVIC;
 
-// use lsm6dsox::Lsm6dsox;
-// use lis3mdl::Lis3mdl;
+// Bring fmt::Write into scope so `write!` works with heapless buffers
+use core::fmt::Write;
 
-use stm32f4xx_hal::{
-    gpio::{gpiob::PB8, gpiob::PB9, Alternate, AF4, Edge, ExtiPin},
-    i2c::I2c,
-    pac::I2C1,
-    rcc::Clocks,
-    pac::GPIOB,
-    time::Hertz,
+
+use lsm6dsox::{
+    registers::*,
+    IMUStreamDriver,
+    Lsm6dsox,
+    types::FifoSample,
+    configs::*,
 };
+use lis3mdl::{registers as lis3mdl_registers, Lis3mdl, CONFIG_WAKEUP_LIS3MDL};
+use stm32f4xx_hal::{
+    pac::{TIM2, Peripherals, GPIOB, USART1, Interrupt, I2C1},    // Import TIM2 type from PAC
+    prelude::*,                                 // Import traits (TimerExt, etc.)
+    timer::{Delay, Timer, DelayUs, Timer2},
+    dwt::MonoTimer,
+    rcc::Clocks,
+    gpio::{Edge, GpioExt, PB5,PA5,PA9,PA10,Alternate,Output,PushPull, ExtiPin},
+    time::Hertz,
+    serial::{config::Config, Event as SerialEvent, Serial, Tx, Rx},
+    i2c::I2c,
+    i2c::Error as I2cError,
+    interrupt::USART1 as USART1_IRQ,
+};
+// use crate::{core_filters, I2C1};
+use heapless::{
+    String as HString,
+    spsc::{Consumer, Producer, Queue}
+};
+use core::cell::RefCell;
+use critical_section::Mutex;
 
-type I2C = I2c<I2C1>;
-
-use stm32f4xx_hal::gpio::GpioExt;
-use stm32f4xx_hal::prelude::*;
-
-use rtic::app;
-use heapless::spsc::{Consumer, Producer, Queue};
-use lsm6dsox::types::FifoSample;
-
-use lsm6dsox::IMUStreamDriver;
-use lsm6dsox::registers::*;
-use lsm6dsox::configs::*;
+use log::{Log, Level, Metadata, Record, LevelFilter,trace, debug, info, warn, error, set_logger, set_max_level};
 
 use lis3mdl::registers::*;
 use lis3mdl::configs::*;
 
 use core_filters::*;
+use cortex_m::peripheral::scb::SystemHandler::SysTick;
+use rtic_monotonics::{Monotonic as Monotonics};
+use systick_monotonic::*;
 
+use embedded_hal::i2c::I2c as I2cTrait;
+use embedded_hal::delay::DelayNs;
+// use rtic::Mutex;
+use crate::core_data_types::ThreeAxes;
+use crate::core_filters::{low_pass_filter_3axes, low_pass_filter_float, FilteredAxes, FilteredTemp};
+use crate::shared_i2c::SharedI2c;
+use crate::sensor_hub_control::SensorHub;
+use crate::core_calibrate::CalibratedGyro;
+use libm::*;
+use stm32f4xx_hal::serial::config::StopBits;
+use crate::app::parse_rx::LocalResources;
+use alloc::boxed::Box;
 use rtt_target::{rprintln, rtt_init_print};
+use core_temp_correction::TempCompensator;
+use embedded_hal::digital::InputPin;
+use fugit::ExtU64;
+use rtic_monotonic::Monotonic;
+use rtic_monotonics::systick::prelude::*;
+
+use rtic::app;
+
+#[global_allocator]
+static ALLOC: embedded_alloc::TlsfHeap = embedded_alloc::TlsfHeap::empty();
+
+// A 16 KiB heap (adjust as needed)
+#[link_section = ".uninit.heap"]
+static mut HEAP_MEMORY: MaybeUninit<[u8; 16 * 1024]> = MaybeUninit::uninit();
+
+type I2C = I2c<I2C1>;
+
+// ---- Global Logger ----
+const LOG_BUF_SIZE: usize   = 1024;
+const TX_QSIZE: usize       = 4096;
+const RX_QSIZE: usize       = 1024;
+const LINE_BUF_SIZE: usize  = 128;
+
+static mut TX_QUEUE: Queue<u8, TX_QSIZE> = Queue::new();
+
+// Producer/Consumer handles (static references)
+static mut TX_PROD: Option<Producer<'static, u8, TX_QSIZE>> = None;
+static mut TX_CONS: Option<Consumer<'static, u8, TX_QSIZE>> = None;
+
+static mut DEBUG_LOG_ACTIVE: bool = true;
+
+type MyMono = Systick<1000>; // 1 kHz = 1 ms resolution
+systick_monotonic!(Mono, 1000);
 
 #[rtic::app(
 device = stm32f4xx_hal::pac,
-dispatchers = [EXTI0])]
+dispatchers = [EXTI0, EXTI1, EXTI2, EXTI3])]
 
 mod app {
-    use cortex_m_rt::entry;
-    use rtt_target::{rprintln, rtt_init_print};
-    // use log::LevelFilter;
-    // use rtt_logger::RTTLogger;
-    use lsm6dsox::{registers, IMUStreamDriver, Lsm6dsox};
-    use lsm6dsox::registers::*;
-    use lis3mdl::{registers as lis3mdl_registers, Lis3mdl, CONFIG_WAKEUP_LIS3MDL};
-    use lis3mdl::registers:: *;
-    use stm32f4xx_hal::{
-        pac::{TIM2, Peripherals, GPIOB},               // Import TIM2 type from PAC
-        prelude::*,                             // Import traits (TimerExt, etc.)
-        timer::{Delay, Timer, DelayUs, Timer2},
-        dwt::MonoTimer,
-        rcc::Clocks,
-        gpio::{Edge, GpioExt, PB5},
-        time::Hertz,
-    };
-    use stm32f4xx_hal::i2c::Error as I2cError;
-    use crate::{core_filters, I2C1};
-    use heapless::spsc::{Consumer, Producer, Queue};
-    use cortex_m::peripheral::scb::SystemHandler::SysTick;
-    use rtic_monotonics::Monotonic;
-    use systick_monotonic::*;
-    // use log::{info, warn, error, debug, trace};
-
-    use lsm6dsox::FifoSample;
-    use stm32f4xx_hal::i2c::I2c;
-    use embedded_hal::i2c::I2c as I2cTrait;
-    use embedded_hal::delay::DelayNs;
-    use rtic::Mutex;
-    use crate::core_data_types::ThreeAxes;
-    use crate::core_filters::{low_pass_filter_3axes, low_pass_filter_float, FilteredAxes, FilteredTemp};
-    use crate::shared_i2c::SharedI2c;
-    use crate::sensor_hub_control::SensorHub;
-    use crate::core_calibrate::CalibratedGyro;
-    use libm::*;
+    use super::*;
 
     const LSM6DSOX_ADDR: u8 = 0x6A;
     const LIS3MDL_ADDR: u8 = 0x1C;
@@ -102,6 +135,35 @@ mod app {
         norm_last:f64,
     }
 
+    pub struct LoggingStates {
+        csvlog_initialized: bool,
+        csvlog_header_printed: bool,
+    }
+    impl Default for LoggingStates {
+        fn default() -> Self {
+            Self {
+                csvlog_initialized: false,
+                csvlog_header_printed: false,
+            }
+        }
+    }
+    impl LoggingStates {
+        fn set_csvlog_header_printed(&mut self, value:bool) -> &mut Self {
+            self.csvlog_header_printed = value;
+            self
+        }
+        fn set_csvlog_initialized(&mut self, value:bool) -> &mut Self {
+            self.csvlog_initialized = value;
+            self
+        }
+        fn is_csvlog_initialized(&self) -> bool {
+            self.csvlog_initialized
+        }
+        fn is_csvlog_header_printed(&self) -> bool {
+            self.csvlog_header_printed
+        }
+    }
+
     pub const GYRO_DRIFT_LIMIT:f32 = 1.0;
     pub const X_SLOPE:f32 = 0.480922085;
     pub const Y_SLOPE:f32 = 0.089927936;
@@ -110,10 +172,17 @@ mod app {
     pub const Y_INTERCEPT:f32 = -2.59064349;
     pub const Z_INTERCEPT:f32 = -3.784211875;
 
-    pub const LPF_ALPHA:f32 = 0.005;
+    pub const LPF_ALPHA:f32 = 0.0025;
 
-#[shared]
+
+    // Backing storage for SPSC queues (must be 'static)
+    static mut TXQ: Queue<u8, TX_QSIZE> = Queue::new();
+    static mut RXQ: Queue<u8, RX_QSIZE> = Queue::new();
+
+
+    #[shared]
     pub struct Shared {
+        int1_pin: PB5,
         sample_producer: Producer<'static, FifoSample, 768>,
         sample_consumer: Consumer<'static, FifoSample, 768>,
         imu_stream: Lsm6dsox<SharedI2c, I2cError>,
@@ -125,32 +194,100 @@ mod app {
         filtered_temp: FilteredTemp,
         gyro_cal: CalibratedGyro,
         acc_state: AccelState,
+        tx: Tx<USART1>,
+        // TX producer used by ISR to push into the transmit byte queue
+        tx_prod: heapless::spsc::Producer<'static, u8, TX_QSIZE>,
+        // TX consumer used by ISR to pull and transmit bytes
+        tx_cons: heapless::spsc::Consumer<'static, u8, TX_QSIZE>,
+        // RX consumer is shared so the parser task can drain bytes
+        rx_cons: heapless::spsc::Consumer<'static, u8, RX_QSIZE>,
+        // Onboard LED for demo commands
+        led: PA5<Output<PushPull>>,
+        logging_state: LoggingStates,
+        tc: TempCompensator,
     }
 
     #[local]
     struct Local {
-        mono: Systick<1000>,
-        int1_pin: PB5,
+        // USART1 TX/RX halves used by the IRQ
+        rx: Rx<USART1>,
+        // RX producer used by ISR to push received bytes
+        rx_prod: heapless::spsc::Producer<'static, u8, RX_QSIZE>,
+        // Accumulate a line for command parsing
+        line_buf: HString<LINE_BUF_SIZE>,
+        log_line_buf: HString<LINE_BUF_SIZE>,
+        last_active_int1_time: Option<rtic_monotonics::fugit::Instant<u32, 1, 1000>>,
+    }
+
+    pub struct UartLogger;
+
+    static UART_LOGGER:UartLogger = UartLogger;
+
+    impl Log for UartLogger {
+        fn enabled(&self, _metadata: &log::Metadata) -> bool { true }
+
+        fn log(&self, record: &Record) { // enqueue log bytes into TX queue use core::fmt::Write;
+            unsafe {
+                if DEBUG_LOG_ACTIVE {
+                    let mut msg: HString<128> = HString::new();
+                    let level = record.level();
+                    // let msg = format!("[{}] {}\r\n", level, record.args());
+                    let _ = write!(&mut msg, "[{}] {}\r\n", level, record.args());
+                    let _ = log_str::spawn(msg).ok();
+                    // rprintln!("{}", msg);
+                }
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    // static instance of the logger static UART_LOGGER: UartLogger = UartLogger;
+    #[task(shared = [tx, tx_prod,tx_cons], priority = 8)]
+    async fn log_str(mut ctx: log_str::Context, s: heapless::String<128>) {
+        ctx.shared.tx_prod.lock(|tx_prod| {
+            enqueue_tx_bytes(tx_prod, s.as_bytes());
+            // enqueue_tx_bytes(tx_prod, b"\r\n");
+        });
+        cortex_m::peripheral::NVIC::pend(USART1_IRQ);
+        ctx.shared.tx_cons.lock(|tx_cons| {
+            ctx.shared.tx.lock(|tx| {
+                let mut len = tx_cons.len();
+                if len > 0 {
+                    tx.listen();
+                    // rprintln!("tx_cons: len = {}", len);
+                }
+            });
+        });
+    }
+    /// Enqueue a byte slice to the TX queue (no blocking). Use from tasks via: /// cx.shared.tx_prod.lock(|tx| enqueue_tx_bytes(tx, ...));
+    fn enqueue_tx_bytes( tx_prod: &mut heapless::spsc::Producer<'static, u8, TX_QSIZE>, bytes: &[u8], ) {
+        for &b in bytes {
+            if tx_prod.enqueue(b).is_err() {
+                // Log or count failure
+                // rprintln!("enqueue_tx_bytes TX queue full, dropping byte! {:#02X}", b);
+            }
+        }
     }
 
     #[init]
     fn init(ctx: init::Context) -> (Shared, Local) {
-        let _rtt_channels = rtt_target::rtt_init! {
-            up: {
-                0: {
-                    size: 4096,
-                    mode: rtt_target::ChannelMode::NoBlockSkip
-                }
-            }
-            down: {
-                0: {
-                    size: 16
-                }
-            }
-        };
-        rtt_target::set_print_channel(_rtt_channels.up.0);
-        // rtt_init_print!();
-        rprintln!("RTIC #[init] started");
+        rtt_init_print!();
+        // Initialize queues
+        let (prod, cons) = cortex_m::singleton!(: Queue<FifoSample, 768> = Queue::new()).unwrap().split();
+        // Create UART byte queues (TX producer and RX consumer) expected by `Shared`
+        // RX queue: producer is typically fed from ISR/driver, consumer is used by the app
+        let (rx_prod, rx_cons) = cortex_m::singleton!(: Queue<u8, RX_QSIZE> = Queue::new()).unwrap().split();
+        // TX queue: producer is used by the app, consumer is typically drained by ISR/driver
+        let (tx_prod, tx_cons) = cortex_m::singleton!(: Queue<u8, TX_QSIZE> = Queue::new()).unwrap().split();
+
+        let mut logging_state:LoggingStates = LoggingStates::default();
+
+
+        set_logger(&UART_LOGGER)
+            .map(|()| log::set_max_level(LevelFilter::Debug))
+            .expect("Logger Init Failed");
+
+        info!("RTIC #[init] started");
 
         let gyro_cal = CalibratedGyro::new(0.5, 100);
         let mut acc_state = AccelState {
@@ -160,31 +297,41 @@ mod app {
             norm_last:0.0,
         };
 
-        // info!("Startup complete");
-        rprintln!("RTT init test print");
-
         let dp = ctx.device;
         let rcc = dp.RCC.constrain();
         let clocks = rcc.cfgr
             .sysclk(84.MHz())  // Request 84 MHz SYSCLK via PLL
-            .freeze();
+            .pclk1(42.MHz()).
+            freeze();
 
         // Create a delay abstraction based on timer TIM2
         let mut delay: DelayUs<TIM2> = dp.TIM2.delay_us(&clocks);
 
-        rprintln!("SYSCLK: {} Hz", clocks.sysclk());
-        rprintln!("PCLK1:  {} Hz", clocks.pclk1());
-        rprintln!("PCLK2:  {} Hz", clocks.pclk2());
+        debug!("SYSCLK: {} Hz", clocks.sysclk());
+        debug!("PCLK1:  {} Hz", clocks.pclk1());
+        debug!("PCLK2:  {} Hz", clocks.pclk2());
 
+        let timer_hz = clocks.sysclk();
+
+        Mono::start(ctx.core.SYST, timer_hz.to_Hz());
 
         // Initialize SYSCFG
         let mut syscfg = dp.SYSCFG.constrain();
         let mut exti = dp.EXTI;
 
+        let gpioa = dp.GPIOA.split();
         let gpiob = dp.GPIOB.split();
+        let gpioc = dp.GPIOC.split();
 
+        // PA5 as LED (LD2 on Nucleo-F401RE)
+        let grn_led = gpioa.pa5.into_push_pull_output();
+
+        let mut tc = TempCompensator::new(52.0); // e.g. ODR = 100 Hz
+
+        // i2c pins
         let scl = gpiob.pb8.into_alternate::<4>().set_open_drain();
         let sda = gpiob.pb9.into_alternate::<4>().set_open_drain();
+        // ext interrputs
         let mut int1_pin = gpiob.pb5.into_floating_input();
         let mut int2_pin = gpiob.pb4.into_floating_input();
 
@@ -192,7 +339,27 @@ mod app {
         int1_pin.enable_interrupt(&mut exti);
         int1_pin.trigger_on_edge(&mut exti, Edge::Rising);
 
-        let mono = Systick::new(ctx.core.SYST, 84_000_000);
+        // USART1 pins: PA9 (TX), PA10 (RX), AF7
+        let tx = gpioa.pa9.into_alternate::<7>();
+        let rx = gpioa.pa10.into_alternate::<7>();
+
+        // Keep Serial unified; Local expects `serial2` (not split halves)
+        let serial2 = Serial::new(
+            dp.USART1,
+            (tx, rx),
+            Config::default()
+                .baudrate(921_600.bps())
+                .wordlength_8()
+                .parity_none()
+                .stopbits(StopBits::STOP1),
+            &clocks,
+        ).unwrap();
+        let (mut tx, mut rx) = serial2.split();
+        rx.listen();
+       info!("Hello from RTIC!\r\n");
+
+        let mut last_active_int1_time: Option<rtic_monotonics::fugit::Instant<u32, 1, 1000>> = None;
+
 
         let mut i2c = HalI2c::new(dp.I2C1, (scl, sda), 100_u32.kHz(), &clocks);
         SharedI2c::init(i2c);
@@ -203,20 +370,20 @@ mod app {
         // imu.init().unwrap();
         // mag.init().unwrap();
 
-        rprintln!("I2C init complete");
+        debug!("I2C init complete");
 
         scan_i2c_bus(&mut imu.i2c());
 
-        rprintln!("Reading WHO_AM_I registers...");
+        debug!("Reading WHO_AM_I registers...");
 
         match read_who_am_i(&mut imu.i2c(), LSM6DSOX_ADDR, 0x0F) {
-            Ok(who) => rprintln!("LSM6DSOX WHO_AM_I = 0x{:02X}", who),
-            Err(_) => rprintln!("Failed to read LSM6DSOX WHO_AM_I"),
+            Ok(who) => debug!("LSM6DSOX WHO_AM_I = 0x{:02X}", who),
+            Err(_) => debug!("Failed to read LSM6DSOX WHO_AM_I"),
         }
 
         match read_who_am_i(&mut imu.i2c(), LIS3MDL_ADDR, 0x0F) {
-            Ok(who) => rprintln!("LIS3MDL WHO_AM_I = 0x{:02X}", who),
-            Err(_) => rprintln!("Failed to read LIS3MDL WHO_AM_I"),
+            Ok(who) => debug!("LIS3MDL WHO_AM_I = 0x{:02X}", who),
+            Err(_) => debug!("Failed to read LIS3MDL WHO_AM_I"),
         }
 
         let mut filtered_acc = FilteredAxes {
@@ -236,9 +403,6 @@ mod app {
             initialized: false,
         };
 
-        // Initialize queue
-        let (prod, cons) = cortex_m::singleton!(: Queue<FifoSample, 768> = Queue::new()).unwrap().split();
-
 
         // Disable embedded functions
         // imu.write_reg(MainReg::FuncCfgAccess.into(), 0x80).unwrap(); // Enable access to embedded registers
@@ -248,7 +412,7 @@ mod app {
         // }
         // imu.write_reg(MainReg::FuncCfgAccess.into(), 0x00).unwrap(); // Exit embedded register access
 
-        rprintln!("Executing LSM6DSOX SW_RESET");
+        debug!("Executing LSM6DSOX SW_RESET");
         imu.write_reg(lsm6dsox::registers::MainReg::Ctrl3C.into(), Ctrl3CFlags::SW_RESET.bits()).unwrap();
         loop {
             if imu.read_reg(lsm6dsox::registers::MainReg::Ctrl3C.into()).unwrap() & Ctrl3CFlags::SW_RESET.bits() == 0 {
@@ -257,28 +421,29 @@ mod app {
             delay.delay_ms(100_u32);
         }
 
-        rprintln!("Dumping MAIN_REGS config");
+        debug!("Dumping MAIN_REGS config");
         imu.dump_config(MAIN_REGS).unwrap();
-        rprintln!("Dumping EMBEDDED_FUNC_REG config");
+        debug!("Dumping EMBEDDED_FUNC_REG config");
         imu.select_register_bank(FuncCfgAccessMode::EmbFuncCfg).unwrap();
         imu.dump_config(EMBEDDED_FUNC_REG).unwrap();
         imu.select_register_bank(FuncCfgAccessMode::User).unwrap();
-        rprintln!("Dumping SENSORHUB_REG config");
+        debug!("Dumping SENSORHUB_REG config");
         imu.select_register_bank(FuncCfgAccessMode::SensorHub).unwrap();
         imu.dump_config(SENSORHUB_REG).unwrap();
         imu.select_register_bank(FuncCfgAccessMode::User).unwrap();
-        rprintln!("Dumping MAG_REGS config");
+        debug!("Dumping MAG_REGS config");
         mag.dump_config(MAG_REGS).unwrap();
-        rprintln!("Dumping debug config complete");
+        debug!("Dumping debug config complete");
 
-        rprintln!("Initializing SensorHub Config");
+        debug!("Initializing SensorHub Config");
         let mut hub = SensorHub::new(&mut imu, &mut mag, &mut delay);
         hub.configure().unwrap();
 
-        rprintln!("9DOF config complete");
+        debug!("Init complete");
 
         (
             Shared {
+                int1_pin,
                 sample_producer: prod,
                 sample_consumer: cons,
                 imu_stream: imu,
@@ -290,41 +455,62 @@ mod app {
                 filtered_temp,
                 gyro_cal,
                 acc_state,
+                led: grn_led,
+                rx_cons,     // keep for app-side dequeue of received bytes
+                tx,
+                tx_prod,
+                tx_cons,
+                logging_state,
+                tc,
             },
             Local {
-                mono,
-                int1_pin,
+                rx,
+                rx_prod,
+                line_buf: HString::new(),
+                log_line_buf: HString::new(),
+                last_active_int1_time,
             }
         )
     }
 
-    #[task(binds = EXTI9_5, priority = 2, shared = [imu_stream, sample_producer], local = [int1_pin])]
+    #[task(binds = EXTI9_5, priority = 1, shared = [int1_pin, imu_stream, sample_producer])]
     fn on_fifo_interrupt(mut cx: on_fifo_interrupt::Context) {
-        cx.local.int1_pin.clear_interrupt_pending_bit();
+        cx.shared.int1_pin.lock(|pin| {
+            pin.clear_interrupt_pending_bit();
+        });
 
         cx.shared.imu_stream.lock(|imu| {
             cx.shared.sample_producer.lock(|queue| {
-                let count = imu.fifo_samples_available().unwrap_or(0);
-                rprintln!("on_fifo_interrupt count: {}", count);
+                let mut intflags_count = imu.fifo_samples_available().unwrap_or((0,0));
+                let (mut intflags, mut count) = intflags_count;
+                // debug!("on_fifo_interrupt count: {:#02x}:{}", intflags, count);
                 // Get gyro settling status
                 let gyro_settling:u8 = imu.get_gyro_settling();
-
-                for _ in 0..count {
-                    if let Ok(sample) = imu.read_fifo_sample() {
-                        // if gyro_settling == 0 {
+                // while intflags != 0 {
+                    for _ in 0..count {
+                        if let Ok(sample) = imu.read_fifo_sample() {
                             if queue.enqueue(sample).is_err() {
-                                rprintln!("on_fifo_interrupt enqueue error");
+                                debug!("on_fifo_interrupt enqueue error");
                             }
-                        // } else {
-                        //     rprintln!("on_fifo_interrupt gyro settling");
-                        // }
+                        }
                     }
-                }
+                    intflags_count = imu.fifo_samples_available().unwrap_or((0,0));
+                    let (mut intflags, mut count) = intflags_count;
+                    if intflags != 0 {
+                        for _ in 0..count {
+                            if let Ok(sample) = imu.read_fifo_sample() {
+                                if queue.enqueue(sample).is_err() {
+                                    debug!("on_fifo_interrupt enqueue error");
+                                }
+                            }
+                        }
+                    }
+                // }
             });
         });
     }
 
-    #[task(priority = 1, shared = [imu_stream, sample_consumer, filtered_acc, filtered_gyr, filtered_mag, filtered_temp, gyro_cal, acc_state], local = [mono])]
+    #[task(priority = 3, shared = [imu_stream, sample_consumer, filtered_acc, filtered_gyr, filtered_mag, filtered_temp, gyro_cal, acc_state, tx_prod, logging_state, tc])]
     async fn process_samples(mut cx: process_samples::Context) {
         let mut las: f32 = 0.0;
         let mut ars: f32 = 0.0;
@@ -332,26 +518,26 @@ mod app {
         let mut current_adjusted_temp:f32 = 0.0;
 
 
-        rprintln!("Processing samples...");
-        
+        // debug!("Processing samples...");
+
         // Get linear acceleration sensitivity
         cx.shared.imu_stream.lock(|imu| {
             match imu.get_linear_acc_sensitivty() {
                 Ok(Some(sensitivity)) => las = sensitivity,
                 Ok(None) => {
-                    rprintln!("get_linear_acc_sensitivty not available (sensor off)");
+                    debug!("get_linear_acc_sensitivty not available (sensor off)");
                 }
                 Err(e) => {
-                    rprintln!("Failed to read get_linear_acc_sensitivty: {:?}", e);
+                    debug!("Failed to read get_linear_acc_sensitivty: {:?}", e);
                 }
             }
             match imu.get_angular_rate_sensitivty() {
                 Ok(Some(sensitivity)) => ars = sensitivity,
                 Ok(None) => {
-                    rprintln!("get_angular_rate_sensitivty not available (sensor off)");
+                    debug!("get_angular_rate_sensitivty not available (sensor off)");
                 }
                 Err(e) => {
-                    rprintln!("Failed to read get_angular_rate_sensitivty: {:?}", e);
+                    debug!("Failed to read get_angular_rate_sensitivty: {:?}", e);
                 }
             }
         });
@@ -369,7 +555,7 @@ mod app {
                         let mut current_accel = ThreeAxes { x, y, z };
                         cx.shared.filtered_acc.lock(|mut filtered_acc| {
                             low_pass_filter_3axes(&current_accel, &mut filtered_acc, LPF_ALPHA);
-                            rprintln!("Accel, {:.3}, {:.3}, {:.3}", filtered_acc.data.x, filtered_acc.data.y, filtered_acc.data.z);
+                            // debug!("Accel, {:.3}, {:.3}, {:.3}", filtered_acc.data.x, filtered_acc.data.y, filtered_acc.data.z);
                             cx.shared.acc_state.lock(|mut acc_state| {
                                 if !acc_state.initialized {
                                     acc_state.norm_last = calculate_sqrt(
@@ -377,15 +563,15 @@ mod app {
                                             filtered_acc.data.y*filtered_acc.data.y +
                                             filtered_acc.data.z*filtered_acc.data.z) as f64).unwrap();
                                     acc_state.initialized = true;
-                                    rprintln!("Accel initialized");
+                                    // debug!("Accel initialized");
                                 } else {
                                     let norm = calculate_sqrt((filtered_acc.data.x*filtered_acc.data.x +
                                                                         filtered_acc.data.y*filtered_acc.data.y +
                                                                         filtered_acc.data.z*filtered_acc.data.z) as f64).unwrap();
                                     let norm_diff = (norm - acc_state.norm_last).abs();
-                                    rprintln!("Accel change, {:.3}, {:.3}, {:.3}", norm_diff, norm, acc_state.norm_last);
+                                    // debug!("Accel change, {:.3}, {:.3}, {:.3}", norm_diff, norm, acc_state.norm_last);
                                     if norm_diff > 2.0 {
-                                        // rprintln!("Accel change, {:.3}, {:.3}, {:.3}", filtered_acc.data.x, filtered_acc.data.y, filtered_acc.data.z);
+                                        // debug!("Accel change, {:.3}, {:.3}, {:.3}", filtered_acc.data.x, filtered_acc.data.y, filtered_acc.data.z);
                                         acc_state.is_stable = false;
                                         acc_state.stable_count = 0;
                                         acc_state.norm_last = norm;
@@ -396,7 +582,7 @@ mod app {
                                             acc_state.is_stable = true;
                                         }
 
-                                        rprintln!("acc_state.is_stable {}", acc_state.is_stable);
+                                        // debug!("acc_state.is_stable {}", acc_state.is_stable);
                                     }
                                 }
                                 cx.shared.gyro_cal.lock(|mut gyro_cal| {
@@ -420,9 +606,15 @@ mod app {
                             // let x: f32 = temp_slope_correction(gyro_data[0] as f32 * ars, current_adjusted_temp, X_SLOPE, 25.0);
                             // let y: f32 = temp_slope_correction(gyro_data[1] as f32 * ars, current_adjusted_temp, Y_SLOPE, 25.0);
                             // let z: f32 = temp_slope_correction(gyro_data[2] as f32 * ars, current_adjusted_temp, Z_SLOPE, 25.0);
-                            let x: f32 = gyro_temp_correction(gyro_data[0] as f32, filtered_temp.data);
-                            let y: f32 = gyro_temp_correction(gyro_data[1] as f32, filtered_temp.data);
-                            let z: f32 = gyro_temp_correction(gyro_data[2] as f32, filtered_temp.data);
+                            // let x: f32 = gyro_temp_correction(gyro_data[0] as f32, filtered_temp.data, 13.55866667, current_adjusted_temp);
+                            // let y: f32 = gyro_temp_correction(gyro_data[1] as f32, filtered_temp.data, 2.445666667, current_adjusted_temp);
+                            // let z: f32 = gyro_temp_correction(gyro_data[2] as f32, filtered_temp.data, 3.157666667, current_adjusted_temp);
+                            let mut x: f32 = gyro_data[0] as f32;
+                            let mut y: f32 = gyro_data[1] as f32;
+                            let mut z: f32 = gyro_data[2] as f32;
+                            cx.shared.tc.lock(|tc| {
+                                (x, y, z) = tc.correct(current_adjusted_temp, x, y, z);
+                            });
                             let mut current_gyro = ThreeAxes { x, y, z };
                             cx.shared.gyro_cal.lock(|mut gyro_cal| {
                                 cx.shared.filtered_gyr.lock(|mut filtered_gyr| {
@@ -433,24 +625,32 @@ mod app {
                                         cal_gyro.z = filtered_gyr.data.z - gyro_cal.data.z;
                                         cx.shared.acc_state.lock(|mut acc_state| {
                                             if acc_state.is_stable {
-                                                // rprintln!("Gyro offset, {:.3}, {:.3}, {:.3}", gyro_cal.data.x, gyro_cal.data.y, gyro_cal.data.z);
-                                                rprintln!("Gyro calibrated, {:.3}, {:.3}, {:.3}", cal_gyro.x, cal_gyro.y, cal_gyro.z);
+                                                // debug!("Gyro offset, {:.3}, {:.3}, {:.3}", gyro_cal.data.x, gyro_cal.data.y, gyro_cal.data.z);
+                                                // debug!("Gyro calibrated, {:.3}, {:.3}, {:.3}", cal_gyro.x, cal_gyro.y, cal_gyro.z);
+                                                debug!("Gyro, {:.3}, {:.3}, {:.3}", filtered_gyr.data.x, filtered_gyr.data.y, filtered_gyr.data.z);
+                                                cx.shared.logging_state.lock(|logging_state| {
+                                                    if logging_state.is_csvlog_header_printed() {
+                                                        let mut msg: HString<128> = HString::new();
+                                                        let _ = write!(&mut msg, "{}, {:.3}, {:.3}, {:.3}\r\n", current_adjusted_temp, filtered_gyr.data.x, filtered_gyr.data.y, filtered_gyr.data.z);
+                                                        log_str::spawn(msg).ok();
+                                                    }
+                                                });
                                             }
                                         });
                                     } else {
-                                        rprintln!("Gyro, {:.3}, {:.3}, {:.3}", filtered_gyr.data.x, filtered_gyr.data.y, filtered_gyr.data.z);
+                                        // debug!("Gyro, {:.3}, {:.3}, {:.3}", filtered_gyr.data.x, filtered_gyr.data.y, filtered_gyr.data.z);
                                         gyro_cal.feed(filtered_gyr.data);
-                                        rprintln!("Gyro Cal Count: {}", gyro_cal.get_cal_count());
+                                        // debug!("Gyro Cal Count: {}", gyro_cal.get_cal_count());
                                     }
                                 });
                             });
                         });
                     }
                     FifoSample::Mag(mag_data) => {
-                        rprintln!("Mag: {:?}", mag_data);
+                        debug!("Mag: {:?}", mag_data);
                     }
                     FifoSample::Temperature(temp_data) => {
-                        let temp_c = (temp_data[0] as f32) / 256.0 + 25.0;
+                        let temp_c = (temp_data[0] as f32) / 256.0;
                         current_adjusted_temp = temp_c; // start with raw; will overwrite with filtered below
 
                         cx.shared.filtered_temp.lock(|filtered_temp| {
@@ -464,31 +664,197 @@ mod app {
                             current_adjusted_temp = filtered_temp.data;
                         });
 
-                        // rprintln!("Temperature: {:#.1} degC", temp_c);
+                        debug!("Temperature: {:#.6} degC", temp_c);
                         cx.shared.acc_state.lock(|acc_state| {
                             if acc_state.is_stable {
                                 // Print filtered temperature when stable
-                                rprintln!("Temperature: {},", current_adjusted_temp);
+                                // debug!("Temperature: {},", current_adjusted_temp);
                             }
                         });
                     }
                     FifoSample::Unknown(tag) => {
-                        rprintln!("Unknown sample type: {:#02X}", tag);
+                        // debug!("Unknown sample type: {:#02X}", tag);
                     }
                 }
             }
         });
     }
 
-    fn gyro_temp_correction(gyro_data: f32, temp: f32) -> f32 {
+    /// USART1 interrupt handler: handles both RXNE and TXE servicing.
+    #[task(binds = USART1, priority = 2, shared = [tx_prod, tx, tx_cons, logging_state], local = [rx, rx_prod])]
+    fn usart1_irq(mut cx: usart1_irq::Context) {
+        // RX path
+        if let Ok(byte) = cx.local.rx.read() {
+            let _ = cx.local.rx_prod.enqueue(byte);
+            cx.shared.logging_state.lock(|logging_state| {
+                if !logging_state.is_csvlog_header_printed() {
+                    cx.shared.tx_prod.lock(|tx_prod| { // Echo back
+                        if tx_prod.enqueue(byte).is_err() {
+                            // Log or count failure
+                            rprintln!("usart1_irq TX queue full, dropping byte!");
+                        }
+                    });
+                }
+            });
+            if byte == b'\r' || byte == b'\n' {
+                parse_rx::spawn().ok();
+            }
+        }
+
+        // TX path
+        cx.shared.tx_cons.lock(|tx_cons| {
+            cx.shared.tx.lock(|tx| {
+                if tx.is_tx_empty() {
+                    if let Some(b) = tx_cons.dequeue() {
+                        tx.write(b).ok();
+                    } else {
+                        tx.unlisten();
+                    }
+                }
+            });
+        });
+    }
+
+    /// Parse any received bytes into commands. Drains RX queue, accumulates a line, and executes.
+    #[task(shared = [tx_prod, rx_cons, led, tx], priority = 6, local = [line_buf])]
+    async fn parse_rx(mut cx: parse_rx::Context) {
+        // Drain RX queue
+        loop {
+            let b_opt = cx.shared.rx_cons.lock(|c| c.dequeue());
+            let b = match b_opt { Some(b) => b, None => break };
+
+
+            // Treat CR/LF as end of command
+            if b == b'\r' || b == b'\n' {
+                if cx.local.line_buf.is_empty() {
+                    continue; // ignore empty line
+                }
+                // Execute command
+                let cmd_buf = core::mem::take(cx.local.line_buf);
+                exec_cmd::spawn(cmd_buf.as_str().parse().unwrap()).ok();
+                // // Prompt
+                // cx.shared.tx_prod.lock(|tx_prod| {
+                //         send_to_uart(tx_prod, &"> ".as_bytes());
+                // });
+                // Kick TX
+                cortex_m::peripheral::NVIC::pend(USART1_IRQ);
+            } else {
+                if cx.local.line_buf.len() < LINE_BUF_SIZE {
+                    cx.local.line_buf.push(b as char).ok();
+                } else {
+                    cx.shared.tx_prod.lock(|tx_prod| {
+                            enqueue_tx_bytes(tx_prod, b"\r\nERR: line too long\r\n");
+                    });
+                    cx.local.line_buf.clear();
+                }
+            }
+            cx.shared.tx.lock(|tx| {
+                tx.listen(); // enables TXE interrupt
+            });
+        }
+    }
+
+// ===== Helpers =====
+
+    /// Minimal command executor.
+    #[task(shared = [tx_prod, tx_cons, tx, imu_stream, gyro_cal, logging_state], priority = 7)]
+    async fn exec_cmd(mut cx: exec_cmd::Context, mut cmd: HString<64>) {
+        cx.shared.tx_prod.lock(|tx_prod| {
+            match cmd.as_str().trim() {
+                "help" => {
+                    send_to_uart(
+                        tx_prod,
+                        &"\r\nCommands:\r\n help - this text\r\n recal - recalibrate gyro\r\n stop debug\r\n csv log\r\n kick imu - restarts fifo read\r\n".as_bytes(),
+                    );
+                }
+                "recal" => {
+                    cx.shared.gyro_cal.lock(|gyro_cal| {
+                        gyro_cal.reset_calibration();
+                    });
+                    send_to_uart(
+                        tx_prod,
+                        &"\r\nrecal started\r\n".as_bytes());
+                }
+                "debug" => unsafe {
+                    if crate::DEBUG_LOG_ACTIVE {
+                        crate::DEBUG_LOG_ACTIVE = false;
+                        rprintln!("debug logging stopped");
+                    } else {
+                        crate::DEBUG_LOG_ACTIVE = true;
+                        rprintln!("debug logging started");
+                    }
+                }
+                "csv on" => unsafe {
+                    if !crate::DEBUG_LOG_ACTIVE {
+                        cx.shared.logging_state.lock(|logging_state| {
+                            if logging_state.is_csvlog_header_printed() {
+                                logging_state.set_csvlog_header_printed(false);
+                                rprintln!("csv logging stopped");
+                            } else {
+                                send_to_uart(
+                                    tx_prod,
+                                    &"temperature, gx, gy, gz\r\n".as_bytes());
+
+                                rprintln!("csv logging started");
+                                logging_state.set_csvlog_header_printed(true);
+                            }
+                        });
+                    } else {
+                        rprintln!("csv log requires debug logging to be disabled use 'debug' to toggle off");
+                    }
+                }
+                "csv off" => {
+                    cx.shared.logging_state.lock(|logging_state| {
+                        logging_state.set_csvlog_header_printed(false);
+                    });
+                }
+                "kick imu" => {
+                    let mut intflags_samples:(u8, u16) = (0, 0);
+                    cx.shared.imu_stream.lock(|imu| {
+                        intflags_samples = imu.fifo_samples_available().unwrap();
+                        imu.dump_fifo();
+                    });
+                    let (intflags, samples) = intflags_samples;
+
+                    let mut resp: Vec<u8, 32> = Vec::new();
+                    let _ = write!(resp, "\r\nimu kicked: {:#02X}:{}\r\n", intflags, samples);
+                    send_to_uart(tx_prod, &resp.as_slice());
+                }
+                other => {
+                    cx.shared.logging_state.lock(|logging_state| {
+                        if !logging_state.is_csvlog_header_printed() {
+                            let mut resp: Vec<u8, 64> = Vec::new();
+                            let _ = write!(resp, "\r\nERR: unknown cmd: {}\r\n", other);
+                            send_to_uart(tx_prod, &resp.as_slice());
+                        }
+                    });
+                }
+            }
+        });
+
+        // Ensure TX starts or keeps going
+        cortex_m::peripheral::NVIC::pend(Interrupt::USART1);
+        cx.shared.tx.lock(|tx| {
+            if tx.is_tx_empty() {
+                cx.shared.tx_cons.lock(|tx_cons| {
+                    if !tx_cons.peek().is_none() { // if there is data to send
+                        tx.listen();
+                    }
+                });
+            }
+        });
+    }
+
+
+    fn gyro_temp_correction(gyro_data: f32, temp: f32, factor: f32, temperature: f32) -> f32 {
         // Reference temperature (°C) at which the gyro was calibrated
         const REF_TEMP_C: f32 = 0.0;
         // Temperature drift slope (units of gyro_data per °C).
         // Adjust this based on your sensor's characterization.
-        const SLOPE: f32 = 0.7;
-
-        let delta_t = temp - REF_TEMP_C;
-        let adjustment = delta_t * SLOPE;
+        // const SLOPE: f32 = 0.7;
+        //
+        // let delta_t = temp - REF_TEMP_C;
+        let adjustment = temperature * factor;
 
         // Apply correction: if your measured drift increases with temperature,
         // subtract the adjustment; if it decreases, flip the sign or SLOPE.
@@ -501,7 +867,7 @@ mod app {
         let y = i16::from_le_bytes([frame[3], frame[4]]);
         let z = i16::from_le_bytes([frame[5], frame[6]]);
 
-        rprintln!("Tag: 0x{:02X}, X: {}, Y: {}, Z: {}", tag, x, y, z);
+        // debug!("Tag: 0x{:02X}, X: {}, Y: {}, Z: {}", tag, x, y, z);
     }
 
     fn scan_i2c_bus<I2C, E>(i2c: &mut I2C)
@@ -509,11 +875,11 @@ mod app {
         I2C: I2cTrait<Error = E>,
         E: core::fmt::Debug,
     {
-        rprintln!("Scanning I2C bus...");
+        debug!("Scanning I2C bus...");
         for addr in 0x08..=0x77 {
             let mut buf = [0u8];
             match i2c.write_read(addr, &[0x00], &mut buf) {
-                Ok(_) => rprintln!(" - Found device at 0x{:02X}", addr),
+                Ok(_) => debug!(" - Found device at 0x{:02X}", addr),
                 Err(_) => {} // No response or error, skip
             }
         }
@@ -529,16 +895,37 @@ mod app {
         Ok(buf[0])
     }
 
-    #[idle(shared = [sample_consumer, delay])]
+    #[idle(shared = [sample_consumer, delay, int1_pin, imu_stream], local = [last_active_int1_time])]
     fn idle(mut ctx: idle::Context) -> ! {
         loop {
-            let queue_len = ctx.shared.sample_consumer.lock(|consumer| consumer.len());
-            // Defer processing to lower-priority task
+            ctx.shared.int1_pin.lock(|pin| {
+                let is_high = pin.is_high().unwrap_or(false);
+
+                match (is_high, ctx.local.last_active_int1_time.as_ref()) {
+                    (true, None) => {
+                        *ctx.local.last_active_int1_time = Some(Mono::now());
+                    }
+                    (true, Some(last_time)) => {
+                        let elapsed = Mono::now() - *last_time;
+                        rprintln!("INT1 active for {} ms", elapsed.to_millis());
+
+                        if elapsed.to_millis() > 100 {
+                            *ctx.local.last_active_int1_time = None;
+                            ctx.shared.imu_stream.lock(|imu| imu.dump_fifo());
+                            rprintln!("INT1 stuck --> fifo dumped");
+                        }
+                    }
+                    (false, _) => {
+                        *ctx.local.last_active_int1_time = None;
+                    }
+                }
+            });
+
+            let queue_len = ctx.shared.sample_consumer.lock(|c| c.len());
             if queue_len > 0 {
                 process_samples::spawn().ok();
-                // cortex_m::asm::wfi(); // Wait for interrupt (power-efficient idle)
             } else {
-                ctx.shared.delay.lock(|delay| delay.delay_ms(100_u32));
+                ctx.shared.delay.lock(|d| d.delay_ms(10_u32));
             }
         }
     }
@@ -562,13 +949,13 @@ mod app {
         measured - (slope * temp_c + intercept)
     }
 
-    // fn wait_for_shub_ready() -> Result<(), Error<E>> {
-    //     loop {
-    //         let status = imu.read_register(MainReg::StatusMasterMainpage)?;
-    //         if status & 0x01 == 0 {
-    //             break;
-    //         }
-    //     }
-    //     Ok(())
-    // }
+    fn send_to_uart(tx_prod: &mut Producer<'static, u8, TX_QSIZE>, bytes: &[u8]) {
+        for &b in bytes {
+            if tx_prod.enqueue(b).is_err() {
+                // Log or count failure
+                rprintln!("send_to_uart TX queue full, dropping byte!");
+            }
+        }
+    }
+
 }

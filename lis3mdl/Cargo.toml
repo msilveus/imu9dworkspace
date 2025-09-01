@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 embedded-hal = "1.0.0"
 bitflags = "2.9.1"
-rtt-target = { version = "0.6.1" }
+log = "0.4.27"
 
 [lib]
 crate-type = ["lib"]

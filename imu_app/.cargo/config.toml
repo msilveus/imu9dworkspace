@@ -1,0 +1,15 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+rustflags = [
+    "-C", "link-arg=-Tlink.x",
+    "-C", "link-arg=-Map=output.map",
+    "-C", "link-arg=--cref"
+]
+runner = "probe-rs run --chip STM32F401RETx"
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+
+# Optional linker args can go here if needed, but usually not required for cortex-m-rt

@@ -72,7 +72,7 @@ pub const CONFIG_WAKEUP_LSM6DSOX: &[RegConfig<MainReg>] = &[
     RegConfig {
         op: RegOp::Write,
         reg: MainReg::Int1Ctrl,
-        value: Int1CtrlBitflags::Int1FifoTh as u8, // INT1_FIFO_TH
+        value: Int1CtrlBitflags::Int1FifoTh.bits() | Int1CtrlBitflags::Int1FifoFull.bits() | Int1CtrlBitflags::Int1FifoFull.bits(), // INT1_FIFO_TH
     },
     RegConfig {
         op: RegOp::Write,
@@ -234,7 +234,7 @@ pub const CONFIG_SENSOR_HUB_LIS3MDL_MIXED: &[AnyRegConfig] = &[
     AnyRegConfig {
         op: RegOp::Write,
         reg: UnifiedRegister::Main(MainReg::Int1Ctrl),
-        value: Int1CtrlBitflags::Int1FifoTh as u8,
+        value: Int1CtrlBitflags::Int1FifoTh.bits() | Int1CtrlBitflags::Int1FifoFull.bits() | Int1CtrlBitflags::Int1FifoFull.bits(), // INT1_FIFO_TH
     },
     AnyRegConfig {
         op: RegOp::Write,
@@ -368,5 +368,3 @@ pub const CONFIG_SH_MASTER_ON: &[RegConfig<SensorHubReg>] = &[
         value: 0, // disable SensorHubReg
     },
 ];
-
-

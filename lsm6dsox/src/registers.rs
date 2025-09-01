@@ -631,17 +631,17 @@ pub enum Decimation {
     Every32nd = 0b110,
 }
 
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Int1CtrlBitflags {
-    Int1DrdyXl      = 1 << 0,
-    Int1DrdyG       = 1 << 1,
-    Int1Boot        = 1 << 2,
-    Int1FifoTh      = 1 << 3,
-    Int1FifoOvr     = 1 << 4,
-    Int1FifoFull    = 1 << 5,
-    Int1CntBdr      = 1 << 6,
-    Int1DenRdy      = 1 << 7,
+bitflags::bitflags! {
+    pub struct Int1CtrlBitflags: u8 {
+        const Int1DrdyXl    = 1 << 0;
+        const Int1DrdyG     = 1 << 1;
+        const Int1Boot      = 1 << 2;
+        const Int1FifoTh    = 1 << 3;
+        const Int1FifoOvr   = 1 << 4;
+        const Int1FifoFull  = 1 << 5;
+        const Int1CntBdr    = 1 << 6;
+        const Int1DenRdy    = 1 << 7;
+    }
 }
 
 #[repr(u8)]

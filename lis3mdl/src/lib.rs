@@ -7,8 +7,9 @@ pub mod configs;
 
 use core::fmt::{Debug, Formatter};
 use embedded_hal::i2c::{I2c, SevenBitAddress};
-use rtt_target::rprintln;
-// use rtt_target::rprintln;
+use log::{Log, Level, Metadata, Record, LevelFilter,trace, debug, info, warn, error, set_logger, set_max_level};
+
+// use rtt_target::debug;
 
 use registers::*;
 
@@ -134,12 +135,12 @@ where
             let addr = entry.reg.addr(); // ← Use your trait method here
             match entry.op {
                 RegOp::Write => {
-                    rprintln!("write_reg {:<21}({:#04X}) = {:#04x}", entry.reg.name(), addr, entry.value);
+                    debug!("write_reg {:<21}({:#04X}) = {:#04x}", entry.reg.name(), addr, entry.value);
                     self.write_reg(addr, entry.value)?
                 },
                 RegOp::Read => {
                     let data = self.read_reg(addr)?;
-                    rprintln!("read_reg {:<21}({:#04X}) = {:#04x}", entry.reg.name(), addr, data);
+                    debug!("read_reg {:<21}({:#04X}) = {:#04x}", entry.reg.name(), addr, data);
                 }
             }
         }
@@ -150,12 +151,10 @@ where
     where
         R: NamedRegister + Copy,
     {
-        use rtt_target::rprintln;
-
         fn show(label: &str, reg: u8, val: Result<u8, impl core::fmt::Debug>) {
             match val {
-                Ok(v) => rprintln!("{:<21}({:#04x}): 0x{:02X} ({:>3}) 0b{:08b}", label, reg, v, v, v),
-                Err(e) => rprintln!("{:<16}: Error: {:?}", label, e),
+                Ok(v) => debug!("{:<21}({:#04x}): 0x{:02X} ({:>3}) 0b{:08b}", label, reg, v, v, v),
+                Err(e) => debug!("{:<16}: Error: {:?}", label, e),
             }
         }
 

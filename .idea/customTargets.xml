@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CLionExternalBuildManager">
+    <target id="8e838434-e82d-469e-92e7-647055a5125c" name="empty" defaultType="TOOL">
+      <configuration id="1a7a5d05-df79-4eef-89b5-e467ba47818f" name="empty" toolchainName="Rust Debugger" />
+    </target>
+  </component>
+</project>

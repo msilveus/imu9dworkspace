@@ -1,4 +1,4 @@
-use rtt_target::rprintln;
+use log::{Log, Level, Metadata, Record, LevelFilter,trace, debug, info, warn, error};
 use crate::core_data_types::ThreeAxes;
 
 #[derive(Debug)]
@@ -68,7 +68,7 @@ impl CalibratedGyro {
 
     pub fn reset_calibration(&mut self) {
         self.init();
-        rprintln!("Resetting Gyro calibration");
+        debug!("Resetting Gyro calibration");
     }
 
     pub fn get_cal_count(&self) -> usize {

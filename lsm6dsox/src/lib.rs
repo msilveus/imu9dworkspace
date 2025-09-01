@@ -1,6 +1,7 @@
 #![no_std]
 #![allow(dead_code)]
 #![allow(unused_imports)]
+#![allow(unused_variables)]
 
 pub mod registers;
 pub mod configs;
@@ -15,9 +16,10 @@ use embedded_hal::delay::*;
 
 use embedded_hal::i2c::{I2c, SevenBitAddress};
 use heapless::spsc::Queue;
-use rtt_target::rprintln;
 pub use configs::{CONFIG_RESET, CONFIG_SELF_TEST_DISABLE, CONFIG_SELF_TEST_ENABLE, CONFIG_STREAMING, CONFIG_WAKEUP_LSM6DSOX};
 use crate::registers::MainReg::{Ctrl1Xl, Ctrl2G};
+use log::{Log, Level, Metadata, Record, LevelFilter,trace, debug, info, warn, error, set_logger, set_max_level};
+use rtt_target::*;
 
 /// Trait alias to support both I2c<SevenBitAddress> and I2c without address mode.
 pub trait CompatibleI2c<E>: I2c<Error = E> {}
@@ -167,12 +169,12 @@ where
             let addr = entry.reg.addr();
             match entry.op {
                 RegOp::Write => {
-                    rprintln!("write_reg {:<21}({:#04X}) = {:#04x}", entry.reg.name(), addr, entry.value);
+                    // debug!("write_reg {:<21}({:#04X}) = {:#04x}", entry.reg.name(), addr, entry.value);
                     self.write_reg(addr, entry.value)?
                 },
                 RegOp::Read => {
                     let data = self.read_reg(addr)?;
-                    rprintln!("read_reg {:<21}({:#04X}) = {:#04x}", entry.reg.name(), addr, data);
+                    // debug!("read_reg {:<21}({:#04X}) = {:#04x}", entry.reg.name(), addr, data);
                 }
             }
         }
@@ -184,12 +186,12 @@ where
             let addr = entry.reg.addr();
             match entry.op {
                 RegOp::Write => {
-                    rprintln!("write_reg {:<21}({:#04X}) = {:#04x}", entry.reg.name(), addr, entry.value);
+                    // debug!("write_reg {:<21}({:#04X}) = {:#04x}", entry.reg.name(), addr, entry.value);
                     self.write_reg(addr, entry.value)?;
                 }
                 RegOp::Read => {
                     let data = self.read_reg(addr)?;
-                    rprintln!("read_reg {:<21}({:#04X}) = {:#04x}", entry.reg.name(), addr, data);
+                    // debug!("read_reg {:<21}({:#04X}) = {:#04x}", entry.reg.name(), addr, data);
                 }
             }
         }
@@ -302,12 +304,10 @@ where
     where
         R: NamedRegister + Copy,
     {
-        use rtt_target::rprintln;
-
         fn show(label: &str, reg: u8, val: Result<u8, impl core::fmt::Debug>) {
             match val {
-                Ok(v) => rprintln!("{:<21}({:#04x}): 0x{:02X} ({:>3}) 0b{:08b}", label, reg, v, v, v),
-                Err(e) => rprintln!("{:<16}: Error: {:?}", label, e),
+                Ok(v) => debug!("{:<21}({:#04x}): 0x{:02X} ({:>3}) 0b{:08b}", label, reg, v, v, v),
+                Err(e) => debug!("{:<16}: Error: {:?}", label, e),
             }
         }
 
@@ -321,12 +321,11 @@ where
     }
 
     pub fn dump_reg_config(&mut self, reg: &MainReg) -> Result<(), Error<E>> {
-        use rtt_target::rprintln;
 
         fn show(label: &str, reg: u8, val: Result<u8, impl core::fmt::Debug>) {
             match val {
-                Ok(v) => rprintln!("{:<21}({:#04x}): 0x{:02X} ({})", label, reg, v, v),
-                Err(e) => rprintln!("{:<16}: Error: {:?}", label, e),
+                Ok(v) => debug!("{:<21}({:#04x}): 0x{:02X} ({})", label, reg, v, v),
+                Err(e) => debug!("{:<16}: Error: {:?}", label, e),
             }
         }
         let label = reg.name();       // &'static str
@@ -411,7 +410,7 @@ pub struct SensorSample {
 pub trait IMUStreamDriver {
     type Error;
 
-    fn fifo_samples_available(&mut self) -> Result<u16, Self::Error>;
+    fn fifo_samples_available(&mut self) -> Result<(u8, u16), Self::Error>;
     fn read_fifo_sample(&mut self) -> Result<FifoSample, Self::Error>;
     fn dump_fifo(&mut self);
 
@@ -424,23 +423,25 @@ where
 {
     type Error = Error<E>;
 
-    fn fifo_samples_available(&mut self) -> Result<u16, Self::Error> {
+    fn fifo_samples_available(&mut self) -> Result<(u8, u16), Self::Error> {
         let fifo_status1 = self.read_reg(MainReg::FifoStatus1.into())?;
         let fifo_status2 = self.read_reg(MainReg::FifoStatus2.into())?;
+        let int_flags = fifo_status2 & 0xF8;
         let sample_count = (((fifo_status2 & 0x03) as u16) << 8) | (fifo_status1 as u8) as u16;
-        Ok(sample_count)
+        // debug!("fifo_samples_available: {:#02x}:{}", int_flags, sample_count);
+        Ok((int_flags, sample_count))
     }
 
     fn read_fifo_sample(&mut self) -> Result<FifoSample, Self::Error> {
         let mut buf = [0u8; 7];
         self.read_fifo_bytes(&mut buf)?;
 
-        // rprintln!("read_fifo_sample {:?}", buf);
+        // debug!("read_fifo_sample {:?}", buf);
 
         let tag_val = (buf[0] & 0xf8) >> 3;
 
         let tag = FifoTags::try_from(tag_val).map_err(|_| Error::UnexpectedFifoTag(tag_val))?;
-        rprintln!("read_fifo_sample tag:{:#02X}({})", tag, tag.name());
+        // debug!("read_fifo_sample tag:{:#02X}({})", tag, tag.name());
 
         let sample = match tag {
             FifoTags::AccelerometerNc => FifoSample::Accel([
@@ -470,33 +471,39 @@ where
     }
 
     fn dump_fifo(&mut self)  {
-        let count = self.fifo_samples_available().unwrap_or(0);
-        rprintln!("FIFO samples available: {}", count);
-        for _ in 0..count {
-            if let Ok(sample) = self.read_fifo_sample() {
-                match sample {
-                    FifoSample::Accel(accel_data) => {
-                        // info!("Accel: {:?}", accel_data);
-                        rprintln!("Accel: {:?}", accel_data);
-                    }
-                    FifoSample::Gyro(gyro_data) => {
-                        // info!("Gyro: {:?}", gyro_data);
-                        rprintln!("Gyro: {:?}", gyro_data);
-                    }
-                    FifoSample::Mag(mag_data) => {
-                        // info!("Mag: {:?}", mag_data);
-                        rprintln!("Mag: {:?}", mag_data);
-                    }
-                    FifoSample::Temperature(temp_data) => {
-                        // info!("Temperature: {:?}", temp_data);
-                        rprintln!("Temperature: {:?}", temp_data);
-                    }
-                    FifoSample::Unknown(tag) => {
-                        // warn!("Unknown sample type: {}", tag);
-                        rprintln!("Unknown sample type: {:#02X}", tag);
+        let mut intflags_count = self.fifo_samples_available().unwrap_or((0, 0));
+        let (_, count) = intflags_count;
+        // debug!("FIFO samples available: {}", count);
+        while intflags_count.1 > 0 {
+            for _ in 0..count {
+                if let Ok(sample) = self.read_fifo_sample() {
+                    match sample {
+                        FifoSample::Accel(_accel_data) => {
+                            // info!("Accel: {:?}", accel_data);
+                            // debug!("Accel: {:?}", accel_data);
+                        }
+                        FifoSample::Gyro(_gyro_data) => {
+                            // info!("Gyro: {:?}", gyro_data);
+                            // debug!("Gyro: {:?}", gyro_data);
+                        }
+                        FifoSample::Mag(_mag_data) => {
+                            // info!("Mag: {:?}", mag_data);
+                            // debug!("Mag: {:?}", mag_data);
+                        }
+                        FifoSample::Temperature(_temp_data) => {
+                            // info!("Temperature: {:?}", temp_data);
+                            // debug!("Temperature: {:?}", temp_data);
+                        }
+                        FifoSample::Unknown(_tag) => {
+                            // warn!("Unknown sample type: {}", tag);
+                            // debug!("Unknown sample type: {:#02X}", tag);
+                        }
                     }
                 }
             }
+            intflags_count = self.fifo_samples_available().unwrap_or((0, 0));
+            let (_, count) = intflags_count;
+            rprintln!("FIFO samples available: {}", count);
         }
     }
 

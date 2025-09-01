@@ -4,13 +4,13 @@ use crate::shared_i2c::SharedI2c;
 use stm32f4xx_hal::pac::TIM2;
 use stm32f4xx_hal::timer::{DelayUs as TimerDelay};
 use embedded_hal::delay::DelayNs;
-use rtt_target::rprintln;
 use lis3mdl::Lis3mdl;
 use lis3mdl::registers::*;
 use lis3mdl::configs::*;
 use lsm6dsox::{FifoSample, Lsm6dsox, IMUStreamDriver};
 use lsm6dsox::registers::*;
 use lsm6dsox::configs::*;
+use log::{Log, Level, Metadata, Record, LevelFilter,trace, debug, info, warn, error};
 
 
 pub struct SensorHub<'a> {
@@ -33,54 +33,54 @@ impl<'a> SensorHub<'a> {
 
         self.imu.write_reg(MainReg::Ctrl9Xl as u8, Ctrl9XlFlags::I3C_DISABLE.bits()).unwrap();
         // Reset Mag config logic
-        rprintln!("Reset Mag config logic");
+        debug!("Reset Mag config logic");
         self.mag.write_reg(MagReg::CtrlReg2 as u8, CtrlReg2Bitflags::SoftReset as u8).unwrap();
         self.delay.delay_us(100);
         self.mag.write_reg(MagReg::CtrlReg2 as u8, 0).unwrap();
         // Done resetting Mag config
-        rprintln!("Done resetting Mag config");
+        debug!("Done resetting Mag config");
         // Reset Acc config logic
-        rprintln!("Reset Acc config logic");
+        debug!("Reset Acc config logic");
         self.imu.write_reg(MainReg::Ctrl3C as u8, Ctrl3CFlags::SW_RESET.bits()).unwrap();
         while self.imu.read_reg(MainReg::Ctrl3C as u8).unwrap() & Ctrl3CFlags::SW_RESET.bits() != 0 {
             self.delay.delay_us(100);
         }
         // Done resetting Acc config
-        rprintln!("Done resetting Acc config");
+        debug!("Done resetting Acc config");
         // Reset Master config logic
-        rprintln!("Reset Master config logic");
+        debug!("Reset Master config logic");
         self.imu.write_reg(SensorHubReg::FuncCfgAccess as u8, FuncCfgAccessMode::SensorHub as u8).unwrap();
         self.imu.write_reg(SensorHubReg::MasterConfig as u8, MasterConfigFlags::RST_MASTER_REGS.bits()).unwrap();
         self.delay.delay_us(300);
         self.imu.write_reg(SensorHubReg::MasterConfig as u8, MasterConfigFlags::empty().bits()).unwrap();
         self.imu.write_reg(SensorHubReg::FuncCfgAccess as u8, FuncCfgAccessMode::User as u8).unwrap();
         // Done resetting Master config
-        rprintln!("Done resetting Master config");
-        // rprintln!("CONFIG_STREAMING");
+        debug!("Done resetting Master config");
+        // debug!("CONFIG_STREAMING");
         // self.imu.apply_config(CONFIG_STREAMING).unwrap();
-        // rprintln!("CONFIG_INT_NOTIFICATION");
+        // debug!("CONFIG_INT_NOTIFICATION");
         // self.imu.apply_config(CONFIG_INT_NOTIFICATION).unwrap();
-        // rprintln!("CONFIG_EMB_FUNCS");
+        // debug!("CONFIG_EMB_FUNCS");
         // self.imu.apply_config(CONFIG_EMB_FUNCS).unwrap();
-        // rprintln!("CONFIG_SENSOR_HUB_LIS3MDL");
+        // debug!("CONFIG_SENSOR_HUB_LIS3MDL");
         // self.imu.apply_config(CONFIG_SENSOR_HUB_LIS3MDL).unwrap();
-        // rprintln!("CONFIG_WAKEUP_LSM6DSOX");
+        // debug!("CONFIG_WAKEUP_LSM6DSOX");
         // self.imu.apply_config(CONFIG_WAKEUP_LSM6DSOX).unwrap();
-        rprintln!("CONFIG_SENSOR_HUB_LIS3MDL_MIXED");
+        debug!("CONFIG_SENSOR_HUB_LIS3MDL_MIXED");
         self.imu.apply_any_config(CONFIG_SENSOR_HUB_LIS3MDL_MIXED).unwrap();
-        rprintln!("CONFIG_WAKEUP_LIS3MDL");
+        debug!("CONFIG_WAKEUP_LIS3MDL");
         self.mag.apply_config(CONFIG_WAKEUP_LIS3MDL).unwrap();
-        rprintln!("CONFIG_SH_MASTER_ON");
+        debug!("CONFIG_SH_MASTER_ON");
         self.imu.apply_config(CONFIG_SH_MASTER_ON).unwrap();
         self.delay.delay_ms(100);
 
         // loop {
         //     let mut buf = [0; 6];
         //     let mut status = self.mag.read_reg(MagReg::StatusReg as u8).unwrap();
-        //     rprintln!("Mag status: {:#02X}", status);
+        //     debug!("Mag status: {:#02X}", status);
         //     if (status & 0x07) == 0x07 {
         //         self.mag.read_bytes(MagReg::OutXL as u8, &mut buf).unwrap();
-        //         rprintln!("mag data: {:?}", buf);
+        //         debug!("mag data: {:?}", buf);
         //         break;
         //     }
         //     loop_counter += 1;
@@ -90,7 +90,7 @@ impl<'a> SensorHub<'a> {
         // }
         // loop {
         //     let mut status = self.imu.read_reg(lsm6dsox::registers::MainReg::StatusMasterMainpage as u8).unwrap();
-        //     rprintln!("StatusMasterMainpage: {:#02X}", status);
+        //     debug!("StatusMasterMainpage: {:#02X}", status);
         //     if (status & lsm6dsox::registers::StatusMasterFlags::SENS_HUB_ENDOP.bits()) == StatusMasterFlags::SENS_HUB_ENDOP.bits() {
         //         break;
         //     }
